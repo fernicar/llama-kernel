@@ -133,7 +133,15 @@ These benchmarks were conducted with:
 - torch.compile with inductor backend
 - Default temperature of 0.6 and top_p of 0.9
 
-The current implementation achieves consistent performance across different prompt types and response lengths, with an average throughput of approximately 22.71 tokens per second on consumer hardware.
+### Hardware Specifications
+
+The benchmark was performed on the following hardware:
+- CPU: Apple M4
+- GPU: Apple M4 (10-core integrated GPU)
+- RAM: 16 GB
+- OS: macOS Darwin 24.3.0 (ARM64)
+
+The current implementation achieves consistent performance across different prompt types and response lengths, with an average throughput of approximately 22.71 tokens per second on the hardware specified above.
 
 ## Advanced Configuration
 
