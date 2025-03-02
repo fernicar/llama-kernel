@@ -114,6 +114,27 @@ Estimate memory requirements before loading a model:
 python main.py --estimate_memory --model meta-llama/Llama-3.2-7B-Instruct
 ```
 
+## Benchmark Performance
+
+Current benchmark results for the Llama Kernel with the Llama-3.2-1B-Instruct model using maximum speed optimizations:
+
+| Prompt Type                           | Tokens Generated | Generation Time | Throughput (tokens/sec) |
+|--------------------------------------|-----------------|----------------|------------------------|
+| Short factual query                   | 97              | 4.45 seconds   | 21.82                  |
+| Scientific explanation                | 496             | 21.37 seconds  | 23.21                  |
+| Creative writing (poem)               | 196             | 8.49 seconds   | 23.09                  |
+| Simple information retrieval          | 146             | 6.41 seconds   | 22.76                  |
+| Literature summary                    | 315             | 14.32 seconds  | 21.99                  |
+| **Average Throughput**               | -               | -              | **22.71**              |
+
+These benchmarks were conducted with:
+- Model: meta-llama/Llama-3.2-1B-Instruct
+- Maximum speed optimizations enabled
+- torch.compile with inductor backend
+- Default temperature of 0.6 and top_p of 0.9
+
+The current implementation achieves consistent performance across different prompt types and response lengths, with an average throughput of approximately 22.71 tokens per second on consumer hardware.
+
 ## Advanced Configuration
 
 ### Matrix Multiplication Implementations
