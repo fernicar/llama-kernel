@@ -1,0 +1,11 @@
+#pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#python.exe -m pip install --upgrade pip
+#pip install poetry
+transformers
+psutil
+matplotlib
+accelerate
+huggingface_hub[hf_xet]
+bitsandbytes
+uvicorn
+fastapi
