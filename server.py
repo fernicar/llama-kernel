@@ -1,16 +1,12 @@
 #!/usr/bin/env python
 """
-An OpenAI-compatible API server for Llama Kernel. V2.
+An OpenAI-compatible API server for Llama Kernel. V0.4
 
-This server loads a Llama 3.2 model using the LlamaInference class
-and serves it through an API endpoint that mimics the OpenAI
-chat completions API.
-
-V2 Changes:
-- Added "fake" streaming support to be compatible with clients like SillyTavern.
-- Implemented the /v1/models endpoint.
-- Correctly formats prompts using the tokenizer's chat template.
-- Integrated detailed request logging for easier debugging.
+V0.4 Changes:
+- Monkeypatches LlamaInference.generate at runtime to avoid editing base code.
+- Correctly handles the `max_tokens` parameter by using `max_new_tokens`.
+- Adds comprehensive logging for each conversational turn (prompt -> response).
+- Exposes the model's context window size in the /v1/models endpoint.
 """
 
 import argparse
@@ -19,7 +15,8 @@ import uuid
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional, Dict, Any, AsyncGenerator
+from typing import List, Optional, Dict, Any, Union, AsyncGenerator
+from types import MethodType
 
 import torch
 import uvicorn
@@ -27,20 +24,73 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# Import the core inference class from your project
 from llama_kernel import LlamaInference
 
-# --- Globals for holding the model and arguments ---
+# --- Globals and Logger ---
+logger = logging.getLogger("uvicorn")
 llama_model: Optional[LlamaInference] = None
 server_args: Optional[argparse.Namespace] = None
 
-# Set up a logger that integrates with Uvicorn
-logger = logging.getLogger("uvicorn")
+# --- MONKEYPATCH SECTION ---
+
+def fixed_generate(
+    self,
+    prompt: Union[str, List[str]],
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 50,
+    repetition_penalty: float = 1.1,
+    do_sample: bool = True,
+    num_return_sequences: int = 1,
+    **kwargs
+) -> Union[str, List[str]]:
+    """
+    A monkeypatched version of LlamaInference.generate that correctly handles
+    new token generation and returns only the completion.
+    This function will replace the original method on the LlamaInference instance.
+    """
+    is_single_prompt = isinstance(prompt, str)
+    prompts = [prompt] if is_single_prompt else prompt
+    
+    inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    prompt_token_counts = [len(x) for x in inputs.input_ids]
+    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,  # Use the correct parameter
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            do_sample=do_sample,
+            num_return_sequences=num_return_sequences,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            **kwargs
+        )
+    
+    decoded_outputs = []
+    for i, output_tensor in enumerate(outputs):
+        prompt_len = prompt_token_counts[i]
+        new_tokens = output_tensor[prompt_len:]
+        decoded_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        decoded_outputs.append(decoded_text)
+    
+    if num_return_sequences > 1:
+        # This logic is for multi-sequence returns, kept for completeness
+        reshaped = [
+            decoded_outputs[i:i+num_return_sequences]
+            for i in range(0, len(decoded_outputs), num_return_sequences)
+        ]
+        return reshaped if not is_single_prompt else reshaped[0]
+
+    return decoded_outputs[0] if is_single_prompt else decoded_outputs
 
 
-# --- Pydantic Models for OpenAI API Compatibility ---
-
-# Models for Request
+# --- Pydantic Models ---
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -51,13 +101,8 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 512
     stream: bool = False
-    # Add other common fields to prevent validation errors from clients
     top_p: Optional[float] = None
-    stop: Optional[List[str]] = None
-    frequency_penalty: Optional[float] = None
-    presence_penalty: Optional[float] = None
 
-# Models for Non-Streaming Response
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
@@ -76,9 +121,8 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
 
-# Models for Streaming Response
 class StreamDelta(BaseModel):
-    content: str
+    content: Optional[str] = None
     role: Optional[str] = None
 
 class StreamChoice(BaseModel):
@@ -93,191 +137,145 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[StreamChoice]
 
-# Models for /v1/models endpoint
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
     owned_by: str = "user"
-    permission: list = []
+    context_window: int
 
 class ModelList(BaseModel):
     object: str = "list"
     data: List[ModelCard]
 
+# --- Prompt Engineering ---
+def prepare_chat_messages(messages: List[ChatMessage]) -> List[Dict[str, str]]:
+    filtered_messages = []
+    for msg in messages:
+        if msg.role == "system" and "Write Assistant's next reply" in msg.content:
+            logger.info("Filtered out generic SillyTavern system prompt.")
+            continue
+        filtered_messages.append({"role": msg.role, "content": msg.content})
+    return filtered_messages
 
-# --- Server Lifespan Management (Model Loading/Unloading) ---
-
+# --- Server Lifespan & Endpoints ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global llama_model, server_args
     logger.info("Server starting up...")
     logger.info(f"Loading model: {server_args.model} on device: {server_args.device}")
-
     try:
         llama_model = LlamaInference(
             model_id=server_args.model,
             device=server_args.device,
             use_flash_attention=server_args.flash_attention,
         )
-        logger.info("Model loaded successfully. Server is ready to accept requests.")
+        # --- APPLYING THE MONKEYPATCH ---
+        # This replaces the instance's generate method with our corrected version
+        llama_model.generate = MethodType(fixed_generate, llama_model)
+        logger.info("Model loaded successfully and generate() method has been monkeypatched.")
     except Exception as e:
         logger.error(f"FATAL: Failed to load model. Error: {e}", exc_info=True)
         llama_model = None
-
     yield
-
     logger.info("Server shutting down...")
-    llama_model = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    logger.info("Cleanup complete. Goodbye!")
-
-
-# --- FastAPI App and Endpoint Definitions ---
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
-    """Provides a list of available models, mimicking the OpenAI API."""
-    model_id = server_args.model if server_args else "unknown"
-    return ModelList(data=[ModelCard(id=model_id)])
+    if llama_model is None or not hasattr(llama_model, 'model'):
+        raise HTTPException(status_code=503, detail="Model is not available.")
+    
+    model_id = server_args.model
+    context_window = llama_model.model.config.max_position_embeddings
+    
+    return ModelList(data=[ModelCard(id=model_id, context_window=context_window)])
 
-async def stream_generator(request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
-    """
-    A "fake" streaming generator. It generates the full response and then
-    yields it in the OpenAI SSE format in a single chunk.
-    """
-    # 1. Generate the full response
-    if llama_model is None:
-        # This case should ideally be caught before calling the generator
-        raise RuntimeError("Model not loaded")
+async def perform_generation(request: ChatCompletionRequest) -> (str, str):
+    if llama_model is None: raise RuntimeError("Model not loaded")
 
-    # Correctly apply the chat template
-    chat_history = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    chat_history = prepare_chat_messages(request.messages)
     prompt = llama_model.tokenizer.apply_chat_template(
-        chat_history,
-        tokenize=False,
-        add_generation_prompt=True
+        chat_history, tokenize=False, add_generation_prompt=True
     )
     
-    generated_text = llama_model.generate(
+    response_content = llama_model.generate(
         prompt=prompt,
-        max_length=request.max_tokens,
+        max_new_tokens=request.max_tokens,
         temperature=request.temperature,
+        top_p=request.top_p,
     )
+    return prompt, response_content
 
-    # The model might include the prompt in its output, so we find where the real response starts
-    # This is common with apply_chat_template
-    assistant_start_marker = "<|start_header_id|>assistant<|end_header_id|>\n\n"
-    if assistant_start_marker in generated_text:
-        response_content = generated_text.split(assistant_start_marker, 1)[-1]
-    else:
-        response_content = generated_text
+async def stream_generator(request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+    prompt, response_content = await perform_generation(request)
+    
+    # --- ENHANCED LOGGING ---
+    logger.info(f"PROMPT:\n{prompt}...")
+    logger.info(f"RESPONSE:\n{response_content}...")
 
-    # 2. Create the streaming response chunk
     chunk = ChatCompletionStreamResponse(
         model=request.model,
-        choices=[StreamChoice(index=0, delta=StreamDelta(content=response_content, role="assistant"))]
+        choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=response_content))]
     )
     yield f"data: {chunk.model_dump_json()}\n\n"
 
-    # 3. Send the final [DONE] message
+    final_chunk = ChatCompletionStreamResponse(
+        model=request.model,
+        choices=[StreamChoice(index=0, delta=StreamDelta(), finish_reason="stop")]
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    
     yield "data: [DONE]\n\n"
-
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(fastapi_request: Request):
-    """
-    Handles chat completion requests, supporting both streaming and non-streaming.
-    """
-    # --- START of Debugging Block ---
     try:
-        # Read the raw JSON body from the request
         request_body = await fastapi_request.json()
-        logger.info(f"Received raw request body:\n{json.dumps(request_body, indent=2)}")
-
-        # Parse the JSON into our Pydantic model
         request = ChatCompletionRequest.model_validate(request_body)
-        logger.info(f"Successfully parsed request for model: {request.model}")
-
     except Exception as e:
         logger.error(f"Error parsing request body: {e}", exc_info=True)
         raise HTTPException(status_code=422, detail=f"Request validation error: {e}")
-    # --- END of Debugging Block ---
 
     if llama_model is None:
-        raise HTTPException(status_code=503, detail="Model is not available or failed to load.")
+        raise HTTPException(status_code=503, detail="Model is not available.")
 
-    # Handle streaming vs. non-streaming
     if request.stream:
-        return StreamingResponse(
-            stream_generator(request),
-            media_type="text/event-stream"
-        )
+        return StreamingResponse(stream_generator(request), media_type="text/event-stream")
     else:
-        # Correctly apply the chat template
-        chat_history = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        prompt = llama_model.tokenizer.apply_chat_template(
-            chat_history,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+        prompt, response_content = await perform_generation(request)
 
-        logger.info(f"Formatted prompt (first 200 chars): '{prompt[:200]}...'")
+        # --- ENHANCED LOGGING ---
+        logger.info(f"PROMPT:\n{prompt}...")
+        logger.info(f"RESPONSE:\n{response_content}...")
 
-        generated_text = llama_model.generate(
-            prompt=prompt,
-            max_length=request.max_tokens,
-            temperature=request.temperature,
-        )
-
-        assistant_start_marker = "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        if assistant_start_marker in generated_text:
-            response_content = generated_text.split(assistant_start_marker, 1)[-1]
-        else:
-            response_content = generated_text
-
-        logger.info(f"Generated response (first 100 chars): '{response_content[:100]}...'")
-
-        tokenizer = llama_model.tokenizer
-        prompt_tokens = len(tokenizer.encode(prompt))
-        completion_tokens = len(tokenizer.encode(response_content))
-        total_tokens = prompt_tokens + completion_tokens
-
+        prompt_tokens_len = len(llama_model.tokenizer.encode(prompt))
+        completion_tokens_len = len(llama_model.tokenizer.encode(response_content))
+        
         return ChatCompletionResponse(
             model=request.model,
             choices=[
                 ChatCompletionResponseChoice(
-                    index=0,
-                    message=ChatMessage(role="assistant", content=response_content)
+                    index=0, message=ChatMessage(role="assistant", content=response_content)
                 )
             ],
             usage=UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
+                prompt_tokens=prompt_tokens_len,
+                completion_tokens=completion_tokens_len,
+                total_tokens=prompt_tokens_len + completion_tokens_len,
             )
         )
 
+# --- Main Execution ---
 def get_server_args():
     parser = argparse.ArgumentParser(description="OpenAI-compatible server for Llama Kernel")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
-                        help="HuggingFace model ID to load.")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device to run inference on (cuda or cpu).")
-    parser.add_argument("--flash_attention", action="store_true",
-                        help="Use Flash Attention 2 for faster inference.")
-    parser.add_argument("--host", type=str, default="127.0.0.1",
-                        help="Host to bind the server to.")
-    parser.add_argument("--port", type=int, default=5000,
-                        help="Port to bind the server to.")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="HuggingFace model ID.")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
+    parser.add_argument("--flash_attention", action="store_true", help="Use Flash Attention 2.")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to.")
+    parser.add_argument("--port", type=int, default=5000, help="Port to bind to.")
     return parser.parse_args()
 
 if __name__ == "__main__":
     server_args = get_server_args()
-    uvicorn.run(
-        app,
-        host=server_args.host,
-        port=server_args.port
-    )
+    uvicorn.run(app, host=server_args.host, port=server_args.port)
