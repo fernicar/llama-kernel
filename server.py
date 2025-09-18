@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-An OpenAI-compatible API server for Llama Kernel. V0.7.4.1
+An OpenAI-compatible API server for Llama Kernel. V0.7.6
 
-V0.7.4.1 Changes:
-- Implemented explicit VRAM cache clearing after every generation to prevent memory creep.
-- Added detailed VRAM logging stages to --fidelity-log to monitor memory usage:
-  - VRAM_AFTER_MODEL_LOAD, VRAM_BEFORE_GENERATION, VRAM_AFTER_GENERATION, VRAM_AFTER_CACHE_CLEAR.
-- Wrapped generation calls in try...finally blocks to ensure cache clearing even on errors (e.g., OOM).
+V0.7.6 Changes:
+- Resolved final Pylance type-checking warning by simplifying the `fixed_generate`
+  monkeypatch to match its single-prompt usage within the server.
+- The monkeypatch now unambiguously returns a single `str`, satisfying all
+  type hints and ensuring type safety.
 """
 
 import argparse
@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
-from typing import List, Optional, Dict, Any, Union, AsyncGenerator
+from typing import List, Optional, Dict, Any, Union, AsyncGenerator, Tuple
 from types import MethodType
 
 import torch
@@ -35,13 +35,13 @@ except ImportError:
 
 # --- Core LlamaInference Import ---
 from llama_kernel import LlamaInference
-from llama_kernel.utils import get_memory_usage # For VRAM logging
+from llama_kernel.utils import get_memory_usage
 
 # --- Globals and Logger ---
 logger = logging.getLogger("uvicorn")
 llama_model: Optional[LlamaInference] = None
 server_args: Optional[argparse.Namespace] = None
-request_logger: 'BaseLogger' = None
+request_logger: Optional['BaseLogger'] = None
 
 # --- Constants ---
 DEFAULT_LLAMA3_SYSTEM_PROMPT_PATTERN = re.compile(
@@ -50,31 +50,41 @@ DEFAULT_LLAMA3_SYSTEM_PROMPT_PATTERN = re.compile(
 SYSTEM_HEADER_START = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
 
 # --- MONKEYPATCH SECTION ---
+# --- THIS IS THE FIX ---
 def fixed_generate(
-    self, prompt: Union[str, List[str]], max_new_tokens: int = 512, **kwargs
-) -> Union[str, List[str]]:
-    is_single_prompt = isinstance(prompt, str)
-    prompts = [prompt] if is_single_prompt else prompt
-    inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    prompt_token_counts = [len(x) for x in inputs.input_ids]
+    self,
+    prompt: str, # Simplified to only accept a single string, matching our usage
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    **kwargs
+) -> str: # Simplified to only return a single string, resolving the type conflict
+    """
+    A simplified and corrected monkeypatch for generate, tailored for the server's
+    single-prompt use case. It unambiguously returns a single string.
+    """
+    # Tokenize the single prompt. No need for batch logic.
+    inputs = self.tokenizer(prompt, return_tensors="pt")
+    prompt_token_count = len(inputs.input_ids[0])
     inputs = {k: v.to(self.device) for k, v in inputs.items()}
+    
     with torch.no_grad():
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
             **kwargs
         )
-    decoded_outputs = []
-    for i, output_tensor in enumerate(outputs):
-        new_tokens = output_tensor[prompt_token_counts[i]:]
-        decoded_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        decoded_outputs.append(decoded_text)
-    return decoded_outputs[0] if is_single_prompt else decoded_outputs
+    
+    # Decode only the new tokens from the single output tensor
+    new_tokens = outputs[0][prompt_token_count:]
+    decoded_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return decoded_text
 
 
 # --- Advanced Logging Classes ---
-def log_vram_usage(logger_instance: 'BaseLogger', stage: str):
-    """Helper to log current VRAM usage if fidelity logging is enabled."""
+def log_vram_usage(logger_instance: Optional['BaseLogger'], stage: str):
     if isinstance(logger_instance, FidelityLogger) and torch.cuda.is_available():
         vram_stats = get_memory_usage()
         vram_data = {
@@ -123,12 +133,12 @@ def create_logger(args: argparse.Namespace) -> BaseLogger:
 
 
 # --- Pydantic Models ---
-class ChatMessage(BaseModel): role: str; content: str
+class ChatMessage(BaseModel): role: Optional[str] = None; content: Optional[str] | List[str] = None
 class ChatCompletionRequest(BaseModel): model: str; messages: List[ChatMessage]; temperature: float = 0.7; max_tokens: int = 512; stream: bool = False; top_p: Optional[float] = None
 class ChatCompletionResponseChoice(BaseModel): index: int; message: ChatMessage; finish_reason: str = "stop"
 class UsageInfo(BaseModel): prompt_tokens: int; completion_tokens: int; total_tokens: int
 class ChatCompletionResponse(BaseModel): id: str; object: str = "chat.completion"; created: int = Field(default_factory=lambda: int(time.time())); model: str; choices: List[ChatCompletionResponseChoice]; usage: UsageInfo
-class StreamDelta(BaseModel): content: Optional[str] = None; role: Optional[str] = None
+class StreamDelta(BaseModel): content: Optional[str] | List[str] = None; role: Optional[str] = None
 class StreamChoice(BaseModel): index: int; delta: StreamDelta; finish_reason: Optional[str] = None
 class ChatCompletionStreamResponse(BaseModel): id: str; object: str = "chat.completion.chunk"; created: int = Field(default_factory=lambda: int(time.time())); model: str; choices: List[StreamChoice]
 class ModelCard(BaseModel): id: str; object: str = "model"; owned_by: str = "user"; context_window: int
@@ -136,14 +146,59 @@ class ModelList(BaseModel): object: str = "list"; data: List[ModelCard]
 
 # --- Prompt Engineering ---
 def prepare_chat_messages(messages: List[ChatMessage]) -> List[Dict[str, str]]:
-    if not messages: return []
-    processed_messages, current_group = [], {'role': messages[0].role, 'content': messages[0].content}
+    """
+    Groups consecutive messages of the same role into a single message entry.
+    This function is now type-safe and correctly handles content that may be
+    a string, a list of strings, or None.
+    """
+    if not messages:
+        return []
+
+    processed_messages = []
+    
+    # Initialize the first group safely, handling potential None values
+    first_msg = messages[0]
+    current_group = {
+        'role': first_msg.role or "unknown", # Default role if None
+        'content': ""
+    }
+    # Safely process the content of the first message
+    if isinstance(first_msg.content, str):
+        current_group['content'] = first_msg.content
+    elif isinstance(first_msg.content, list):
+        # Join list items with a newline, filtering out any non-string elements
+        current_group['content'] = "\n".join(str(item) for item in first_msg.content)
+
+    # Iterate through the rest of the messages
     for msg in messages[1:]:
-        if msg.role == current_group['role']: current_group['content'] += "\n" + msg.content
+        # Ensure the message has a role to compare against
+        msg_role = msg.role or "unknown"
+        
+        # If the current message has the same role as the current group
+        if msg_role == current_group['role']:
+            # Append its content to the current group's content, handling different types
+            if isinstance(msg.content, str):
+                current_group['content'] += "\n" + msg.content
+            elif isinstance(msg.content, list):
+                current_group['content'] += "\n" + "\n".join(str(item) for item in msg.content)
+            # If msg.content is None, we do nothing and effectively skip it
         else:
+            # The role has changed, so the current group is complete.
+            # Add the completed group to the processed list.
             processed_messages.append(current_group)
-            current_group = {'role': msg.role, 'content': msg.content}
+            
+            # Start a new group with the current message, safely handling its content
+            new_content = ""
+            if isinstance(msg.content, str):
+                new_content = msg.content
+            elif isinstance(msg.content, list):
+                new_content = "\n".join(str(item) for item in msg.content)
+            
+            current_group = {'role': msg_role, 'content': new_content}
+    
+    # Add the last group after the loop finishes
     processed_messages.append(current_group)
+    
     return processed_messages
 
 
@@ -152,11 +207,13 @@ def prepare_chat_messages(messages: List[ChatMessage]) -> List[Dict[str, str]]:
 async def lifespan(app: FastAPI):
     global llama_model, server_args, request_logger
     server_args = get_server_args()
+    assert server_args is not None
     request_logger = create_logger(server_args)
     logger.info("Server starting up...")
 
     original_from_pretrained = transformers.AutoModelForCausalLM.from_pretrained
     def patched_from_pretrained(*args, **kwargs):
+        assert server_args is not None
         if server_args.load_in_4bit:
             logger.info("Monkeypatch: Intercepted from_pretrained. Applying 4-bit quantization config.")
             if not BB_ACCELERATE_AVAILABLE: raise RuntimeError("bitsandbytes/accelerate not available for 4-bit loading.")
@@ -171,7 +228,7 @@ async def lifespan(app: FastAPI):
         llama_model.generate = MethodType(fixed_generate, llama_model)
         logger.info(f"Model '{server_args.model}' loaded successfully.")
         if server_args.load_in_4bit: logger.info("Model is 4-bit quantized.")
-        log_vram_usage(request_logger, "VRAM_AFTER_MODEL_LOAD") # Log baseline VRAM
+        log_vram_usage(request_logger, "VRAM_AFTER_MODEL_LOAD")
     except Exception as e:
         logger.error(f"FATAL: Failed to load model: {e}", exc_info=True)
         llama_model = None
@@ -185,63 +242,62 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
-    # ... (code unchanged)
     if not llama_model: raise HTTPException(status_code=503, detail="Model not available.")
+    assert server_args is not None
     model_id = server_args.model
     context_window = llama_model.model.config.max_position_embeddings
     response_data = ModelList(data=[ModelCard(id=model_id, context_window=context_window)])
-    request_logger.log("MODEL_METADATA_RESPONSE", response_data)
+    if request_logger: request_logger.log("MODEL_METADATA_RESPONSE", response_data)
     return response_data
 
-async def perform_generation(request: ChatCompletionRequest) -> (str, str):
+async def perform_generation(request: ChatCompletionRequest) -> Tuple[str, str | List[str]]:
     if not llama_model: raise RuntimeError("Model not loaded")
     chat_history = prepare_chat_messages(request.messages)
-    request_logger.log("PRE_TEMPLATE_MESSAGES", chat_history)
+    if request_logger: request_logger.log("PRE_TEMPLATE_MESSAGES", chat_history)
     prompt = llama_model.tokenizer.apply_chat_template(chat_history, tokenize=False, add_generation_prompt=True)
     if prompt.startswith(SYSTEM_HEADER_START):
         prompt, num_replacements = DEFAULT_LLAMA3_SYSTEM_PROMPT_PATTERN.subn("", prompt)
         if num_replacements > 0: logger.warning(f"Removed default Llama 3 system prompt injection.")
-    request_logger.log("FINAL_PROMPT", prompt)
-
+    if request_logger: request_logger.log("FINAL_PROMPT", prompt)
     log_vram_usage(request_logger, "VRAM_BEFORE_GENERATION")
     try:
-        response_content = llama_model.generate(prompt=prompt, max_new_tokens=request.max_tokens, temperature=request.temperature, top_p=request.top_p)
+        response_content = llama_model.generate(
+            prompt=prompt,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=(request.top_p or 0.9)
+        )
         log_vram_usage(request_logger, "VRAM_AFTER_GENERATION")
-        request_logger.log("MODEL_RESPONSE", response_content)
+        if request_logger: request_logger.log("MODEL_RESPONSE", response_content)
         return prompt, response_content
     except Exception as e:
         logger.error(f"Error during model generation: {e}", exc_info=True)
-        # Re-raise the exception so the caller knows something went wrong
         raise e
 
 async def stream_generator(request: ChatCompletionRequest, response_id: str) -> AsyncGenerator[str, None]:
     try:
-        prompt, response_content = await perform_generation(request)
+        _prompt, response_content = await perform_generation(request)
         chunk = ChatCompletionStreamResponse(id=response_id, model=request.model, choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=response_content))])
-        request_logger.log("OUTBOUND_CHUNK (content)", chunk)
+        if request_logger: request_logger.log("OUTBOUND_CHUNK (content)", chunk)
         yield f"data: {chunk.model_dump_json()}\n\n"
         final_chunk = ChatCompletionStreamResponse(id=response_id, model=request.model, choices=[StreamChoice(index=0, delta=StreamDelta(), finish_reason="stop")])
-        request_logger.log("OUTBOUND_CHUNK (finish)", final_chunk)
+        if request_logger: request_logger.log("OUTBOUND_CHUNK (finish)", final_chunk)
         yield f"data: {final_chunk.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
         log_vram_usage(request_logger, "VRAM_AFTER_CACHE_CLEAR")
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(fastapi_request: Request):
     try:
         request_body = await fastapi_request.json()
-        request_logger.log("INBOUND_REQUEST", request_body)
+        if request_logger: request_logger.log("INBOUND_REQUEST", request_body)
         request = ChatCompletionRequest.model_validate(request_body)
     except Exception as e: raise HTTPException(status_code=422, detail=f"Request validation error: {e}")
     if not llama_model: raise HTTPException(status_code=503, detail="Model is not available.")
-    
     response_id = f"chatcmpl-{uuid.uuid4()}"
-
     if request.stream:
-        # The generator itself now handles the try...finally for cache clearing
         return StreamingResponse(stream_generator(request, response_id), media_type="text/event-stream")
     else:
         try:
@@ -249,14 +305,11 @@ async def create_chat_completion(fastapi_request: Request):
             prompt_tokens_len = len(llama_model.tokenizer.encode(prompt))
             completion_tokens_len = len(llama_model.tokenizer.encode(response_content))
             response = ChatCompletionResponse(id=response_id, model=request.model, choices=[ChatCompletionResponseChoice(index=0, message=ChatMessage(role="assistant", content=response_content))], usage=UsageInfo(prompt_tokens=prompt_tokens_len, completion_tokens=completion_tokens_len, total_tokens=prompt_tokens_len + completion_tokens_len))
-            request_logger.log("OUTBOUND_RESPONSE", response)
+            if request_logger: request_logger.log("OUTBOUND_RESPONSE", response)
             return response
         finally:
-            # Explicit cache clearing for the non-streaming path
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
             log_vram_usage(request_logger, "VRAM_AFTER_CACHE_CLEAR")
-
 
 # --- Main Execution ---
 def get_server_args():
