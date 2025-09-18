@@ -1,0 +1,50 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Server",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& { . 'G:\\llama-kernel\\.venv\\Scripts\\Activate.ps1'; python 'G:\\llama-kernel\\server.py' --fidelity-log }"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$python"]
+    },
+    {
+      "label": "Run Server Uncensored",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& { . 'G:\\llama-kernel\\.venv\\Scripts\\Activate.ps1'; python 'G:\\llama-kernel\\server.py' --fidelity-log --model nicoboss/Llama-3.2-1B-Instruct-Uncensored }"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$python"]
+    },
+    {
+      "label": "Run Server Uncensored (4bit)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& { . 'G:\\llama-kernel\\.venv\\Scripts\\Activate.ps1'; python 'G:\\llama-kernel\\server.py' --load-in-4bit --fidelity-log --model nicoboss/Llama-3.2-1B-Instruct-Uncensored }"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$python"]
+    }
+  ]
+}
